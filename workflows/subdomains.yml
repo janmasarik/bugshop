@@ -1,0 +1,387 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+
+metadata:
+  generateName: subdomains-
+
+spec:
+  entrypoint: subdomainenum
+  onExit: exit-handler
+
+  arguments:
+    parameters:
+      - name: domain
+        value:
+      - name: company
+        value: ""
+      - name: chain
+        value: "[]"
+
+  volumes:
+    - name: my-secret-vol
+      secret:
+        secretName: gitlab-ssh
+    - name: config
+      secret:
+        secretName: configs
+
+  templates:
+    - name: subdomainenum
+      steps:
+        - - name: amass
+            template: amass
+          - name: subfinder
+            template: subfinder
+          - name: prepare-wordlist
+            template: prepare-wordlist
+        - - name: massdns
+            template: massdns
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{steps.prepare-wordlist.outputs.artifacts.results}}"
+        - - name: parsemassdns
+            template: parsemassdns
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{steps.massdns.outputs.artifacts.results}}"
+        - - name: merge-and-resolve
+            template: merge-and-resolve
+            arguments:
+              artifacts:
+                - name: amass
+                  from: "{{steps.amass.outputs.artifacts.results}}"
+                - name: subfinder
+                  from: "{{steps.subfinder.outputs.artifacts.results}}"
+                - name: parsemassdns
+                  from: "{{steps.parsemassdns.outputs.artifacts.results}}"
+        - - name: altdns
+            template: altdns
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{steps.merge-and-resolve.outputs.artifacts.subdomains}}"
+        - - name: altmassdns
+            template: massdns
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{steps.altdns.outputs.artifacts.results}}"
+        - - name: altparsemassdns
+            template: parsemassdns
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{steps.altmassdns.outputs.artifacts.results}}"
+        - - name: final-merge-and-resolve
+            template: final-merge-and-resolve
+            arguments:
+              artifacts:
+                - name: amass
+                  from: "{{steps.amass.outputs.artifacts.results}}"
+                - name: subfinder
+                  from: "{{steps.subfinder.outputs.artifacts.results}}"
+                - name: parsemassdns
+                  from: "{{steps.parsemassdns.outputs.artifacts.results}}"
+                - name: altdns
+                  from: "{{steps.altparsemassdns.outputs.artifacts.results}}"
+        - - name: push-results
+            template: push-results
+            arguments:
+              artifacts:
+                - name: resolvable
+                  from: "{{steps.final-merge-and-resolve.outputs.artifacts.resolvable}}"
+                - name: subdomains
+                  from: "{{steps.final-merge-and-resolve.outputs.artifacts.subdomains}}"
+
+    - name: amass
+      inputs:
+        artifacts:
+          - name: wordlists
+            path: /wordlists/resolvers.txt
+            s3: &resolvers
+              endpoint: storage.googleapis.com
+              bucket: perma
+              key: resolvers.txt
+              accessKeySecret:
+                name: minio-secrets
+                key: accessKey
+              secretKeySecret:
+                name: minio-secrets
+                key: secretKey
+      nodeSelector:
+        cloud.google.com/gke-nodepool: preemptible
+      container:
+        image: s14ve/amass:2.9.10
+        resources:
+          requests:
+            memory: 4Gi
+          limits:
+            memory: 8Gi
+        volumeMounts:
+          - name: config
+            mountPath: "/config"
+        args:
+          [
+            "-d",
+            "{{workflow.parameters.domain}}",
+            "-config",
+            "/config/amass",
+            "-active",
+            "-o",
+            "/tmp/amass.txt",
+            "-rf",
+            "/wordlists/resolvers.txt",
+            "-max-dns-queries",
+            "50000",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/amass.txt
+
+    - name: subfinder
+      inputs:
+        artifacts:
+          - name: config
+            path: /wordlists/resolvers.txt
+            s3: *resolvers
+      container:
+        image: s14ve/subfinder:1.2.1
+        volumeMounts:
+          - name: config
+            mountPath: "/root/.config/subfinder/"
+        args:
+          [
+            "-d",
+            "{{workflow.parameters.domain}}",
+            "-o",
+            "/tmp/subfinder.txt",
+            "-rL",
+            "/wordlists/resolvers.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/subfinder.txt
+
+    - name: prepare-wordlist
+      inputs:
+        artifacts:
+          - name: wordlists
+            path: /wordlists/subdomains.txt
+            s3: &subdomains
+              endpoint: storage.googleapis.com
+              bucket: perma
+              key: subdomains.txt
+              accessKeySecret:
+                name: minio-secrets
+                key: accessKey
+              secretKeySecret:
+                name: minio-secrets
+                key: secretKey
+      container:
+        image: alpine:3.9
+        command: [sh, -c]
+        args:
+          [
+            "sed -e 's/$/.{{workflow.parameters.domain}}/' /wordlists/subdomains.txt > /tmp/massdns_input.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/massdns_input.txt
+
+    - name: massdns
+      inputs:
+        artifacts:
+          - name: input
+            path: /tmp/input.txt
+          - name: wordlists
+            path: /wordlists/resolvers.txt
+            s3: *resolvers
+      container:
+        image: s14ve/massdns:1.0
+        args:
+          [
+            "-r",
+            "/wordlists/resolvers.txt",
+            "--verify-ip",
+            "-t",
+            "A",
+            "-o",
+            "S",
+            "-w",
+            "/tmp/raw_massdns.out",
+            "/tmp/input.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/raw_massdns.out
+
+    - name: parsemassdns
+      inputs:
+        artifacts:
+          - name: input
+            path: /tmp/raw_massdns.out
+      container:
+        image: alpine:3.9
+        command: [sh, -c]
+        args:
+          [
+            "cut -d ' ' -f1 /tmp/raw_massdns.out | sed 's/.$//' > /tmp/massdns.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/massdns.txt
+
+    - name: altdns
+      inputs:
+        artifacts:
+          - name: input
+            path: /tmp/domains.txt
+          - name: wordlists
+            path: /wordlists/words.txt
+            s3: &words
+              endpoint: storage.googleapis.com
+              bucket: perma
+              key: words.txt
+              accessKeySecret:
+                name: minio-secrets
+                key: accessKey
+              secretKeySecret:
+                name: minio-secrets
+                key: secretKey
+      container:
+        image: s14ve/altdns:1.0
+        args:
+          [
+            "-i",
+            "/tmp/domains.txt",
+            "-w",
+            "/wordlists/words.txt",
+            "-o",
+            "/tmp/altdns.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/altdns.txt
+
+    - name: merge-and-resolve
+      inputs:
+        artifacts:
+          - name: amass
+            path: /tmp/amass.txt
+          - name: subfinder
+            path: /tmp/subfinder.txt
+          - name: parsemassdns
+            path: /tmp/parsemassdns.txt
+      container:
+        image: s14ve/resolvable:1.0
+        args: [
+            "/tmp/resolvable.txt",
+            "/tmp/subdomains.txt",
+            "/tmp/amass.txt",
+            "/tmp/subfinder.txt",
+            "/tmp/parsemassdns.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: subdomains
+            path: /tmp/subdomains.txt
+
+    - name: final-merge-and-resolve
+      inputs:
+        artifacts:
+          - name: amass
+            path: /tmp/amass.txt
+          - name: subfinder
+            path: /tmp/subfinder.txt
+          - name: parsemassdns
+            path: /tmp/parsemassdns.txt
+          - name: altdns
+            path: /tmp/altdns.txt
+      container:
+        image: s14ve/resolvable:1.0
+        args: [
+            "/tmp/resolvable.txt",
+            "/tmp/subdomains.txt",
+            "/tmp/amass.txt",
+            "/tmp/subfinder.txt",
+            "/tmp/parsemassdns.txt",
+            "/tmp/altdns.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: resolvable
+            path: /tmp/resolvable.txt
+          - name: subdomains
+            path: /tmp/subdomains.txt
+
+    - name: push-results
+      retryStrategy:
+        limit: 3
+      inputs:
+        artifacts:
+          - name: resolvable
+            path: /tmp/resolvable.txt
+          - name: subdomains
+            path: /tmp/subdomains.txt
+          - name: targetdata
+            path: /targetdata
+            git:
+              repo: git@gitlab.com:janmasarik/targetdata.git
+              revision: master
+              sshPrivateKeySecret:
+                name: gitlab-ssh
+                key: ssh-private-key
+      script:
+        image: alpine/git:1.0.4
+        command: [sh]
+        source: |
+          cd /targetdata
+          git pull
+          mkdir "/targetdata/{{workflow.parameters.domain}}"
+          cp /tmp/resolvable.txt "/targetdata/{{workflow.parameters.domain}}/resolvable.txt"
+          cp /tmp/subdomains.txt "/targetdata/{{workflow.parameters.domain}}/subdomains.txt"
+          cp /secret/ssh-private-key /ssh-private
+          chmod 400 /ssh-private
+          git config --global user.email "subdomains@argo.com"
+          git config --global user.name "{{workflow.name}}"
+          git add *
+          git commit -m "{{workflow.name}} | {{workflow.parameters.domain}}"
+          GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no -i /ssh-private' git push
+        volumeMounts:
+          - name: my-secret-vol
+            mountPath: "/secret"
+
+    - name: exit-handler
+      steps:
+        - - name: chain
+            template: chain
+            when: "{{workflow.status}} == Succeeded"
+            arguments:
+              parameters:
+                - name: workflow
+                  value: "{{item}}"
+            withParam: "{{workflow.parameters.chain}}"
+    - name: chain
+      inputs:
+        parameters:
+          - name: workflow
+      container:
+        image: byrnedo/alpine-curl:0.1
+        args:
+          [
+            "-d",
+            '{"domain":"{{workflow.parameters.domain}}", "company":"{{workflow.parameters.company}}", "workflow":"{{inputs.parameters.workflow}}.yml", "chain":[]}',
+            "-H",
+            "Content-Type: application/json",
+            "-X",
+            "POST",
+            "http://argo-gateway.domain.com:12000/secret-webhook-endpoint",
+          ]

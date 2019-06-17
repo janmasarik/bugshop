@@ -1,0 +1,210 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+
+metadata:
+  generateName: subtakeover-
+
+spec:
+  entrypoint: subtakover
+
+  arguments:
+    parameters:
+      - name: domain
+        value:
+      - name: company
+        value: ""
+      - name: chain
+        value: "[]"
+
+  volumes:
+    - name: my-secret-vol
+      secret:
+        secretName: gitlab-ssh
+    - name: config
+      secret:
+        secretName: configs
+
+  templates:
+    - name: subtakover
+      steps:
+        - - name: subjack
+            template: subjack
+          - name: subjackssl
+            template: subjack
+            arguments:
+              parameters:
+                - name: ssl
+                  value: "-ssl"
+          - name: tko-subs
+            template: tko-subs
+        - - name: parseoutput
+            template: parseoutput
+            arguments:
+              artifacts:
+                - name: tko-subs
+                  from: "{{steps.tko-subs.outputs.artifacts.results}}"
+        - - name: filteroutput
+            template: filteroutput
+            arguments:
+              artifacts:
+                - name: tko-subs
+                  from: "{{steps.parseoutput.outputs.artifacts.results}}"
+                - name: subjack
+                  from: "{{steps.subjack.outputs.artifacts.results}}"
+                - name: subjackssl
+                  from: "{{steps.subjackssl.outputs.artifacts.results}}"
+        - - name: push-results
+            template: push-results
+            arguments:
+              parameters:
+                - name: takeoverable
+                  value: "{{steps.filteroutput.outputs.result}}"
+
+    - name: subjack
+      inputs:
+        parameters:
+          - name: ssl
+            value: ""
+        artifacts:
+          - name: targetdata
+            path: /targetdata
+            git: &targetdata
+              repo: git@gitlab.com:janmasarik/targetdata.git
+              revision: master
+              sshPrivateKeySecret:
+                name: gitlab-ssh
+                key: ssh-private-key
+          - name: fingerprints
+            path: /config/fingerprints.json
+            s3: &config
+              endpoint: storage.googleapis.com
+              bucket: perma
+              key: fingerprints.json
+              accessKeySecret:
+                name: minio-secrets
+                key: accessKey
+              secretKeySecret:
+                name: minio-secrets
+                key: secretKey
+      container:
+        image: s14ve/subjack:1.0
+        args:
+          [
+            "-w",
+            "/targetdata/{{workflow.parameters.domain}}/subdomains.txt",
+            "-t",
+            "50",
+            "-timeout",
+            "30",
+            "-o",
+            "/subjack.txt",
+            "-a",
+            "-m",
+            "-c",
+            "/config/fingerprints.json",
+            "{{inputs.parameters.ssl}}",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /subjack.txt
+
+    - name: tko-subs
+      inputs:
+        artifacts:
+          - name: targetdata
+            path: /targetdata
+            git: *targetdata
+      container:
+        image: s14ve/tko-subs:1.0
+        args:
+          [
+            "-domains",
+            "/targetdata/{{workflow.parameters.domain}}/subdomains.txt",
+            "-output",
+            "/tmp/tko-subs.csv",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/tko-subs.csv
+
+    - name: parseoutput
+      inputs:
+        artifacts:
+          - name: tko-subs
+            path: /tmp/tko-subs.out
+      container:
+        image: alpine:3.9
+        command: [sh, -c]
+        args:
+          [
+            "cut -d ',' -f1-4 /tmp/tko-subs.out | grep 'true' | cut -d ',' -f1-3 > /tmp/tko-subs.csv",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/tko-subs.csv
+
+    - name: filteroutput
+      inputs:
+        artifacts:
+          - name: tko-subs
+            path: /tmp/tko-subs.csv
+          - name: subjackssl
+            path: /tmp/subjackssl.out
+          - name: subjack
+            path: /tmp/subjack.out
+      script:
+        image: python:alpine3.7
+        command: [python]
+        source: |
+          from contextlib import suppress
+          subjack = []
+          with suppress(IsADirectoryError):
+              subjack.extend(open('/tmp/subjack.out').read().splitlines())
+          with suppress(IsADirectoryError):
+              subjack.extend(open('/tmp/subjackssl.out').read().splitlines())
+          subjack = set(subjack)
+          blacklist = ['sendgrid']
+          for i in subjack:
+              if not i or any(b in i for b in blacklist):
+                  continue
+              l = i.replace('[', '')
+              l = l.replace(']', '')
+              l = l.replace('-', '')
+              parsed = l.split()
+              print(f'{parsed[0]},{parsed[1:]},subjack')
+          tko_subs = open('/tmp/tko-subs.csv').read().splitlines()
+          for t in tko_subs:
+              if not t or any(b in t for b in blacklist):
+                  continue
+              print(f'{t},tko_subs')
+
+    - name: push-results
+      retryStrategy:
+        limit: 3
+      inputs:
+        parameters:
+          - name: takeoverable
+        artifacts:
+          - name: targetdata
+            path: /targetdata
+            git: *targetdata
+      script:
+        image: alpine/git:1.0.4
+        command: [sh]
+        source: |
+          cd /targetdata
+          git pull
+          echo "{{inputs.parameters.takeoverable}}" > "/targetdata/{{workflow.parameters.domain}}/takeoverable.csv"
+          cp /secret/ssh-private-key /ssh-private
+          chmod 400 /ssh-private
+          git config --global user.email "subtakover@argo.com"
+          git config --global user.name "{{workflow.name}}"
+          git add *
+          git commit -m "{{workflow.name}} | {{workflow.parameters.domain}}"
+          GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no -i /ssh-private' git push
+        volumeMounts:
+          - name: my-secret-vol
+            mountPath: "/secret"

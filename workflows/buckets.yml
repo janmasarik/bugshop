@@ -1,0 +1,441 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+
+metadata:
+  generateName: buckets-
+
+spec:
+  entrypoint: buckets
+
+  arguments:
+    parameters:
+      - name: domain
+        value:
+      - name: company
+        value:
+      - name: chain
+        value: "[]"
+
+  volumes:
+    - name: gitlab-ssh
+      secret:
+        secretName: gitlab-ssh
+    - name: gcp-account
+      secret:
+        secretName: gcp-account
+    - name: config
+      secret:
+        secretName: configs
+
+  templates:
+    - name: buckets
+      dag:
+        tasks:
+          - name: altdnsgen
+            template: altdnsgen
+          - name: generatedomainfile
+            template: generatedomainfile
+          - name: generate-bucketnames
+            template: generate-bucketnames
+          - name: parsealtdns
+            template: parse-bucket-names
+            dependencies: [altdnsgen]
+            arguments:
+              parameters:
+                - name: input-domain
+                  value: "{{workflow.parameters.domain}}"
+                - name: domain
+                  value: placeholder.com
+              artifacts:
+                - name: input
+                  from: "{{tasks.altdnsgen.outputs.artifacts.results}}"
+          - name: second-altdns
+            template: second-altdns
+            dependencies: [parsealtdns, generatedomainfile]
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{tasks.parsealtdns.outputs.artifacts.results}}"
+                - name: domainfile
+                  from: "{{tasks.generatedomainfile.outputs.artifacts.results}}"
+          - name: parse-s3-input
+            template: parse-bucket-names
+            dependencies: [second-altdns, generate-bucketnames]
+            arguments:
+              parameters:
+                - name: input-domain
+                  value: ".placeholder.com"
+                - name: domain
+                  value: ".s3.amazonaws.com"
+              artifacts:
+                - name: input
+                  from: "{{tasks.second-altdns.outputs.artifacts.results}}"
+          - name: s3-massdns
+            template: s3-massdns
+            dependencies: [parse-s3-input]
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{tasks.parse-s3-input.outputs.artifacts.results}}"
+                - name: domains-input
+                  from: "{{tasks.parsealtdns.outputs.artifacts.results}}"
+                - name: domains-input
+                  from: "{{tasks.parsealtdns.outputs.artifacts.results}}"
+          - name: parse-s3-massdns
+            template: parsemassdns
+            dependencies: [s3-massdns]
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{tasks.s3-massdns.outputs.artifacts.results}}"
+          - name: bucketsperm-aws
+            template: bucketsperm
+            dependencies: [parse-s3-massdns]
+            arguments:
+              parameters:
+                - name: providers
+                  value: "s3"
+              artifacts:
+                - name: input
+                  from: "{{tasks.parse-s3-massdns.outputs.artifacts.results}}"
+          - name: bucketsperm-other-providers
+            template: bucketsperm
+            dependencies: [generate-bucketnames]
+            arguments:
+              parameters:
+                - name: providers
+                  value: "google,digitalocean,alicloud"
+              artifacts:
+                - name: input
+                  from: "{{tasks.generate-bucketnames.outputs.artifacts.results}}"
+          - name: push-results
+            template: push-results
+            dependencies: [bucketsperm-aws, bucketsperm-other-providers]
+            arguments:
+              artifacts:
+                - name: buckets-aws
+                  from: "{{tasks.bucketsperm-aws.outputs.artifacts.buckets}}"
+                - name: vulnerable-buckets-aws
+                  from: "{{tasks.bucketsperm-aws.outputs.artifacts.vulnerable-buckets}}"
+                - name: buckets-other
+                  from: "{{tasks.bucketsperm-other-providers.outputs.artifacts.buckets}}"
+                - name: vulnerable-buckets-other
+                  from: "{{tasks.bucketsperm-other-providers.outputs.artifacts.vulnerable-buckets}}"
+
+    - name: altdnsgen
+      inputs:
+        artifacts:
+          - name: targetdata
+            path: /targetdata
+            git: &targetdata
+              repo: git@gitlab.com:janmasarik/targetdata.git
+              revision: master
+              sshPrivateKeySecret:
+                name: gitlab-ssh
+                key: ssh-private-key
+          - name: wordlists
+            path: /wordlists/words.txt
+            s3: &words
+              endpoint: storage.googleapis.com
+              bucket: perma
+              key: words.txt
+              accessKeySecret:
+                name: minio-secrets
+                key: accessKey
+              secretKeySecret:
+                name: minio-secrets
+                key: secretKey
+      container:
+        image: s14ve/altdns:1.0
+        resources:
+          requests:
+            memory: 2.5Gi
+          limits:
+            memory: 5Gi
+        args:
+          [
+            "-i",
+            "/targetdata/{{workflow.parameters.domain}}/subdomains.txt",
+            "-w",
+            "/wordlists/words.txt",
+            "-o",
+            "/tmp/tmpaltdns.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/tmpaltdns.txt
+
+    - name: generate-bucketnames
+      inputs:
+        artifacts:
+          - name: wordlists
+            path: /wordlists/words.txt
+            s3: *words
+      container:
+        image: s14ve/generate-bucketnames:1.2
+        args:
+          [
+            "-w",
+            "/wordlists/words.txt",
+            "-sd",
+            "{{workflow.parameters.domain}}",
+            "-o",
+            "/tmp/probable-buckets.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/probable-buckets.txt
+
+    - name: second-altdns
+      inputs:
+        artifacts:
+          - name: domainfile
+            path: /tmp/domain.txt
+          - name: input
+            path: /tmp/input.txt
+      container:
+        image: s14ve/altdns:1.0
+        resources:
+          requests:
+            memory: 2.5Gi
+          limits:
+            memory: 5Gi
+        args:
+          [
+            "-i",
+            "/tmp/input.txt",
+            "-w",
+            "/tmp/domain.txt",
+            "-o",
+            "/tmp/tmpaltdns.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/tmpaltdns.txt
+
+    - name: bucketsperm
+      retryStrategy:
+        limit: 3
+      inputs:
+        parameters:
+          - name: providers
+        artifacts:
+          - name: input
+            path: /tmp/input_buckets.txt
+      container:
+        image: s14ve/bucketsperm:1.1
+        resources:
+          requests:
+            memory: 4Gi
+          limits:
+            memory: 8Gi
+        args:
+          [
+            "-i",
+            "/tmp/input_buckets.txt",
+            "--only-vulnerable-file",
+            "/tmp/vulnerable_buckets.txt",
+            "-o",
+            "/tmp/buckets.txt",
+            "-q",
+            "--enabled-providers",
+            "{{inputs.parameters.providers}}",
+          ]
+        env:
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: aws
+                key: accesskey
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: aws
+                key: secretkey
+          - name: AWS_ID
+            valueFrom:
+              secretKeyRef:
+                name: aws
+                key: aws_id
+          - name: AWS_USER
+            valueFrom:
+              secretKeyRef:
+                name: aws
+                key: aws_user
+          - name: DO_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: digitalocean
+                key: accesskey
+          - name: DO_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: digitalocean
+                key: secretkey
+          - name: DO_USER_ID
+            valueFrom:
+              secretKeyRef:
+                name: digitalocean
+                key: do_id
+          - name: GOOGLE_SERVICE_ACCOUNT_FILEPATH
+            value: "/secret/service-account-json"
+        volumeMounts:
+          - name: gcp-account
+            mountPath: "/secret"
+      outputs:
+        artifacts:
+          - name: vulnerable-buckets
+            path: /tmp/vulnerable_buckets.txt
+          - name: buckets
+            path: /tmp/buckets.txt
+
+    - name: s3-massdns
+      inputs:
+        artifacts:
+          - name: input
+            path: /tmp/input.txt
+          - name: resolvers
+            path: /wordlists/resolvers.txt
+            s3: &resolvers
+              endpoint: storage.googleapis.com
+              bucket: perma
+              key: resolvers.txt
+              accessKeySecret:
+                name: minio-secrets
+                key: accessKey
+              secretKeySecret:
+                name: minio-secrets
+                key: secretKey
+      container:
+        image: s14ve/massdns:1.0
+        args:
+          [
+            "-r",
+            "/wordlists/resolvers.txt",
+            "--verify-ip",
+            "-t",
+            "CNAME",
+            "-o",
+            "S",
+            "-w",
+            "/tmp/raw_massdns.out",
+            "/tmp/input.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/raw_massdns.out
+
+    - name: parsemassdns
+      inputs:
+        parameters:
+          - name: remove-string
+            value: "s3-directional"
+        artifacts:
+          - name: input
+            path: /tmp/raw_massdns.out
+      container:
+        image: alpine:3.9
+        command: [sh, -c]
+        args:
+          [
+            "echo '{{inputs.parameters.remove-string}}' && sed '/{{inputs.parameters.remove-string}}/d' /tmp/raw_massdns.out | cut -d ' ' -f1 | sed 's/.s3.amazonaws.com.$//' > /tmp/s3buckets.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/s3buckets.txt
+
+    - name: parse-bucket-names
+      inputs:
+        parameters:
+          - name: domain
+          - name: input-domain
+        artifacts:
+          - name: input
+            path: /tmp/input.txt
+      container:
+        image: alpine:3.9
+        command: [sh, -c]
+        args:
+          [
+            "echo 's/{{inputs.parameters.input-domain}}/{{inputs.parameters.domain}}/g' && sed 's/{{inputs.parameters.input-domain}}/{{inputs.parameters.domain}}/g' /tmp/input.txt > /tmp/buckets.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/buckets.txt
+
+    - name: generatedomainfile
+      container:
+        image: alpine:3.9
+        command: [sh, -c]
+        args:
+          [
+            "echo {{workflow.parameters.domain}} | rev | cut -d '.' -f2 | rev > /tmp/domain.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/domain.txt
+
+    - name: push-results
+      retryStrategy:
+        limit: 3
+      inputs:
+        artifacts:
+          - name: buckets-aws
+            path: /tmp/buckets-aws.txt
+          - name: vulnerable-buckets-aws
+            path: /tmp/vulnerable-buckets-aws.txt
+          - name: buckets-other
+            path: /tmp/buckets-other.txt
+          - name: vulnerable-buckets-other
+            path: /tmp/vulnerable-buckets-other.txt
+          - name: targetdata
+            path: /targetdata
+            git:
+              repo: git@gitlab.com:janmasarik/targetdata.git
+              revision: master
+              sshPrivateKeySecret:
+                name: gitlab-ssh
+                key: ssh-private-key
+          - name: alerts
+            path: /alerts
+            git:
+              repo: git@gitlab.com:janmasarik/targets-alerts.git
+              revision: master
+              sshPrivateKeySecret:
+                name: gitlab-ssh
+                key: ssh-private-key
+      script:
+        image: alpine/git:1.0.4
+        command: [sh]
+        source: |
+          cp /secret/ssh-private-key /ssh-private
+          chmod 400 /ssh-private
+          git config --global user.email "buckets@argo.com"
+          git config --global user.name "{{workflow.name}}"
+
+          cd /targetdata
+          git pull
+          cp /tmp/buckets-aws.txt "/targetdata/{{workflow.parameters.domain}}/buckets.txt"
+          cat /tmp/buckets-other.txt >> "/targetdata/{{workflow.parameters.domain}}/buckets.txt"
+          git add *
+          git commit -m "{{workflow.name}} | {{workflow.parameters.domain}}"
+          GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no -i /ssh-private' git push
+
+          cd /alerts
+          git pull
+          mkdir /alerts/{{workflow.parameters.domain}} || true 
+          cp /tmp/vulnerable-buckets-aws.txt "/alerts/{{workflow.parameters.domain}}/vulnerable_buckets.txt"
+          cat /tmp/vulnerable-buckets-other.txt >> "/alerts/{{workflow.parameters.domain}}/vulnerable_buckets.txt"
+          git add *
+          git commit -m "{{workflow.name}} | {{workflow.parameters.domain}}"
+          GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no -i /ssh-private' git push
+        volumeMounts:
+          - name: gitlab-ssh
+            mountPath: "/secret"

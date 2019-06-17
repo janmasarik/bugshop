@@ -1,0 +1,37 @@
+[[rules]]
+entropies = ["3-8"]
+description = "AWS Key"
+regex = '''AKIA[0-9A-Z]{16}'''
+tags = ["key"]
+
+[whitelist]
+files = [
+  "(.*?)(jpg|gif|doc|pdf|bin)$"
+]
+#commits = [
+#  "whitelisted-commit1",
+#  "whitelisted-commit2",
+#]
+#repos = [
+#	"whitelisted-repo"
+#]
+
+# Additional Examples
+
+
+#
+#
+# [[rules]]
+# description = "Generic Key"
+# regex = '''(?i)key(.{0,6})?(:|=|=>|:=)'''
+# entropies = ["4.1-4.3"]
+# filetypes = [".gee"]
+# entropyROI = "line"
+# tags = ["key"]
+# severity = "medium"
+
+# [[rules]]
+# description = "Any pem file"
+# filetypes = [".key"]
+# tags = ["pem"]
+# severity = "high"

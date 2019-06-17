@@ -1,0 +1,128 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+
+metadata:
+  generateName: azure-buckets-perf-
+
+spec:
+  entrypoint: entrypoint
+
+  arguments:
+    parameters:
+      - name: domains-list-url
+        value:
+      - name: words-wordlist-url
+        value: "https://raw.githubusercontent.com/infosec-au/altdns/master/words.txt"
+      - name: resolvers-list-url
+        value: "https://raw.githubusercontent.com/blechschmidt/massdns/master/lists/resolvers.txt"
+
+  templates:
+    - name: entrypoint
+      steps:
+        - - name: account-brute-massdns
+            template: massdns
+        - - name: parse-massdns
+            template: parse-massdns
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{steps.account-brute-massdns.outputs.artifacts.results}}"
+        - - name: get-buckets
+            template: get-buckets-wfuzz
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{steps.parse-massdns.outputs.artifacts.results}}"
+        - - name: get-listable-buckets
+            template: get-listable-buckets-wfuzz
+            arguments:
+              artifacts:
+                - name: input
+                  from: "{{steps.get-buckets.outputs.artifacts.results}}"
+
+    - name: massdns
+      inputs:
+        artifacts:
+          - name: domains
+            path: /tmp/domains.txt
+            mode: 0755
+            http:
+              url: "{{workflow.parameters.domains-list-url}}"
+          - name: resolvers
+            path: /tmp/resolvers.txt
+            mode: 0755
+            http:
+              url: "{{workflow.parameters.resolvers-list-url}}"
+      container:
+        image: s14ve/massdns:1.0
+        args:
+          [
+            "-r",
+            "/tmp/resolvers.txt",
+            "--verify-ip",
+            "-t",
+            "CNAME",
+            "-o",
+            "S",
+            "-w",
+            "/tmp/raw_massdns.out",
+            "/tmp/domains.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/raw_massdns.out
+
+    - name: parse-massdns
+      inputs:
+        artifacts:
+          - name: input
+            path: /tmp/raw_massdns.out
+      container:
+        image: alpine:3.9
+        command: [sh, -c]
+        args:
+          [
+            "sed '/CNAME/!d' /tmp/raw_massdns.out | cut -d ' ' -f1 | sed 's/.$//' > /tmp/accounts.txt",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/accounts.txt
+
+    - name: get-buckets-wfuzz
+      inputs:
+        artifacts:
+          - name: words
+            path: /tmp/words.txt
+            mode: 0755
+            http:
+              url: "{{workflow.parameters.words-wordlist-url}}"
+          - name: input
+            path: /tmp/accounts.txt
+      container:
+        image: brokenscripts/wfuzz
+        args:
+          [
+            "-w /tmp/accounts.txt -w /tmp/words.txt -oF /tmp/readable-buckets.txt --sh 213 -Z 'https://FUZZ/FUZ2Z/test'",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/readable-buckets.txt
+
+    - name: get-buckets-wfuzz
+      inputs:
+        artifacts:
+          - name: input
+            path: /tmp/readable-buckets.txt
+      container:
+        image: brokenscripts/wfuzz
+        args:
+          [
+            "-w /tmp/readable-buckets.txt  -oF /tmp/listable-buckets.txt --hh 221 -Z 'FUZZ/?restype=container&comp=list'",
+          ]
+      outputs:
+        artifacts:
+          - name: results
+            path: /tmp/listable-buckets.txt
