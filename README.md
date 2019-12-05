@@ -1,8 +1,6 @@
 # Bugshop
 
-<aside class="notice">
-This README is intentionally not a detailed overview on how to set up Bugshop to avoid skids auto-pwning random organizations (especially after more workflows will be included).
-</aside>
+Bugshop is heavily WIP
 
 ## Pre-requsites
 1. Working Kubernetes cluster (preferably on GKE due to IAP setup)
