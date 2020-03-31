@@ -1,6 +1,6 @@
 # Bugshop
 
-Bugshop is heavily WIP, but stay tuned for new updates planned in April. :-)
+Bugshop is heavily WIP, but stay tuned for new updates (using new Argo Server directly instead of Events) planned in April. :-)
 
 ## Pre-requsites
 1. Working Kubernetes cluster (preferably on GKE due to IAP setup)
