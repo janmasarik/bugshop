@@ -1,6 +1,9 @@
 # Bugshop
 
-Bugshop is heavily WIP, but stay tuned for new updates (using new Argo Server directly instead of Events) planned in April. :-)
+Bugshop is heavily WIP and still more of a PoC, but stay tuned for new updates (using new Argo Server directly instead of Events). :-)
+
+- [Talk](https://vimeo.com/383296402) and [slides](https://masarik.sh/s/automating-bug-bounty)
+- [Thesis](https://is.muni.cz/th/de05t/master_thesis_final.pdf)
 
 ## Pre-requsites
 1. Working Kubernetes cluster (preferably on GKE due to IAP setup)
